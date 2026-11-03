@@ -8,7 +8,14 @@ python3.13 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 datadraft leagues <sleeper_username>          # find your league id
 datadraft trade <league_id> "A, B for C"      # you send A and B, you get C
+datadraft waivers <league_id> --team <you>    # best adds, and who to drop for them
+datadraft startsit <league_id> --team <you>   # this week's best lineup
 ```
+
+`--team` takes your Sleeper username, team name or roster number. Waivers checks the top
+50 free agents against your bench and labels each one free agent or waivers ("best add
+if you win the claim"); FAAB bids aren't modeled. Start/sit leaves players whose games
+have kicked off in their slots with their actual points and only fills the open slots.
 
 Your team is whichever roster holds A and B, so anyone in the league can run it.
 Set `ANTHROPIC_API_KEY` to add the court's sourced for/against arguments; without it

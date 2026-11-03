@@ -387,7 +387,7 @@ def def_line(game: dict) -> dict | None:
 def project(snap, *, use_sleeper: bool = True) -> dict[int, dict[str, Cell]]:
     """{week: {player_id: Cell}} for every horizon week in the snapshot.
     use_sleeper=False is the guard-failure path: the baseline covers every cell."""
-    has_nfl = bool(snap.nflverse)
+    has_nfl = "ff_opportunity" in (snap.nflverse or {})
     avail = Availability(snap)
     base = Baseline(snap, snap.current_week) if has_nfl else None
     out = {}

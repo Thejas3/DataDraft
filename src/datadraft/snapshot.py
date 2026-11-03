@@ -39,6 +39,7 @@ class Snapshot:
     warnings: tuple = ()  # shown with the ruling (stale build, players missing from build)
     nflverse: dict = field(default_factory=dict)  # build's nflverse frames (empty: file mode)
     xwalk: dict = field(default_factory=dict)  # player_id -> (nflverse_key, match) (D4)
+    transactions: list = field(default_factory=list)  # this week's and last week's (D23)
 
     @property
     def snapshot_id(self) -> str:
@@ -93,6 +94,7 @@ def build_snapshot(client: SleeperClient, league_id: str) -> Snapshot:
     if current > 1:
         matchups = client.matchups(league_id, current - 1)
         shas["matchups"] = matchups.sha
+    txns = _transactions(client, league_id, current, shas)
     snap0 = Snapshot(season, current, dt.date.today(), league.data, rosters.data,
                      users.data, {}, {}, "", "")
     projections = {}
@@ -118,9 +120,24 @@ def build_snapshot(client: SleeperClient, league_id: str) -> Snapshot:
         league_stale=league.stale or rosters.stale,
         schedule=schedule.data,
         matchups=matchups.data if matchups else [],
+        transactions=txns,
     )
     save_manifest(snap)
     return snap
+
+
+def _transactions(client, league_id: str, current: int, shas: dict) -> list:
+    """This week's and last week's transactions: recent drops sit on waivers (D23)."""
+    out = []
+    for week in sorted({max(1, current - 1), current}):
+        t = client.transactions(league_id, week)
+        shas[f"txn:{week}"] = t.sha
+        out += t.data or []
+    return out
+
+
+def _stored_transactions(store, shas: dict) -> list:
+    return [row for k in sorted(shas) if k.startswith("txn:") for row in store.get(shas[k]) or []]
 
 
 def current_build_id(c) -> str:
@@ -190,6 +207,7 @@ def from_build(c, build_id: str, client: SleeperClient, league_id: str) -> Snaps
     if current > 1:
         matchups = client.matchups(league_id, current - 1)
         shas["matchups"] = matchups.sha
+    txns = _transactions(client, league_id, current, shas)
     snap0 = Snapshot(season, current, dt.date.today(), league.data, rosters.data,
                      users.data, {}, {}, "", "")
     weeks = [w for w in range(current, snap0.last_week() + 1) if w in b_weeks]
@@ -223,6 +241,7 @@ def from_build(c, build_id: str, client: SleeperClient, league_id: str) -> Snaps
         warnings=tuple(warnings),
         nflverse=_build_nflverse(c, build_id),
         xwalk=xwalk,
+        transactions=txns,
     )
 
 
@@ -263,7 +282,8 @@ def load_snapshot(snapshot_id: str) -> Snapshot:
                     store.get(shas["users"]), store.get(shas["players"]), projections,
                     m["build_as_of"], m["league_as_of"], shas, m["league_stale"],
                     store.get(shas["schedule"]),
-                    store.get(shas["matchups"]) if "matchups" in shas else [])
+                    store.get(shas["matchups"]) if "matchups" in shas else [],
+                    transactions=_stored_transactions(store, shas))
 
 
 def _load_from_db(c, snapshot_id: str) -> Snapshot:
@@ -284,4 +304,5 @@ def _load_from_db(c, snapshot_id: str) -> Snapshot:
                     _build_projections(c, build_id, m["weeks"]), m["build_as_of"],
                     m["league_as_of"], shas, m["league_stale"], store.get(sched[0]),
                     store.get(shas["matchups"]) if "matchups" in shas else [],
-                    build_id, tuple(m.get("warnings") or ()), _build_nflverse(c, build_id), xwalk)
+                    build_id, tuple(m.get("warnings") or ()), _build_nflverse(c, build_id), xwalk,
+                    _stored_transactions(store, shas))

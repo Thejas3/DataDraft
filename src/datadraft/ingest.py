@@ -125,6 +125,9 @@ class SleeperClient:
     def users(self, league_id: str) -> Fetched:
         return self._get(f"/v1/league/{league_id}/users")
 
+    def transactions(self, league_id: str, week: int) -> Fetched:
+        return self._get(f"/v1/league/{league_id}/transactions/{week}")
+
     def matchups(self, league_id: str, week: int) -> Fetched:
         return self._get(f"/v1/league/{league_id}/matchups/{week}")
 

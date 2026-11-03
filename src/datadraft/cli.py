@@ -2,6 +2,8 @@
 
   datadraft leagues <sleeper_username> [--season 2026]
   datadraft trade <league_id> "A, B for C" [--no-court] [--band 1.0]
+  datadraft waivers <league_id> --team <username or roster number>
+  datadraft startsit <league_id> --team <username or roster number>
 
 With DATABASE_URL set (Milestone 2), rulings sit on the daily build in Postgres:
   datadraft db init                      create the tables
@@ -107,6 +109,126 @@ def render(result) -> str:
     if result.ledger_key:
         out.append(f"\nFrozen in the ledger as `{result.ledger_key}`.")
     return "\n".join(out) + "\n"
+
+
+def _chip(c) -> str:
+    bits = [c.source] + ([c.availability] if c.availability else []) + \
+        (["approx. scoring"] if getattr(c, "approx", False) else [])
+    return "`" + " · ".join(b for b in bits if b) + "`"
+
+
+def find_roster(snap, client, team: str) -> int | None:
+    """A roster number, a Sleeper username/display name, or a team name."""
+    if team.isdigit() and any(int(r["roster_id"]) == int(team) for r in snap.rosters):
+        return int(team)
+    key = team.strip().lower()
+    uid = next((u["user_id"] for u in snap.users
+                if key in {str(u.get("display_name", "")).lower(),
+                           str((u.get("metadata") or {}).get("team_name", "")).lower()}), None)
+    if uid is None:
+        try:
+            uid = (client.user(team).data or {}).get("user_id")
+        except FetchError:
+            uid = None
+    for r in snap.rosters:
+        if uid and (r.get("owner_id") == uid or uid in (r.get("co_owners") or [])):
+            return int(r["roster_id"])
+    return None
+
+
+def render_waivers(result) -> str:
+    snap, w = result.snapshot, result.waivers
+    if result.error:
+        return f"# Waivers: unavailable\n\n{result.error}\n"
+    me = team_name(snap, w.roster_id)
+    out = [f"# Waivers: {me}\n",
+           f"Weeks {w.weeks[0]}-{w.weeks[-1]} · {w.considered} free agents beat someone on "
+           f"your roster at their position · projections as of {snap.build_as_of} · "
+           f"rosters as of {snap.league_as_of}\n"]
+    if not w.picks:
+        out.append(f"No free agent beats your bench right now (checked {snap.league_as_of}).")
+    else:
+        out += ["| Add | Drop | Lineup change, pts/week | Status |", "|---|---|---:|---|"]
+        for p in w.picks:
+            drop = player_name(snap.players, p.drop) if p.drop else "(open roster spot)"
+            status = "Waivers: best add if you win the claim" if p.status == "waivers" \
+                else "Free agent"
+            out.append(f"| {player_name(snap.players, p.add)} | {drop} | "
+                       f"**{_signed(p.delta)}** | {status} |")
+        top = w.picks[0]
+        out.append(f"\nTop pick, by week: " + ", ".join(
+            f"wk {wk} {_signed(v)}" for wk, v in top.side.per_week.items()))
+    for n in result.notes:
+        out.append(f"\n> {n}")
+    return "\n".join(out) + "\n"
+
+
+def render_startsit(result) -> str:
+    snap, s = result.snapshot, result.startsit
+    if result.error:
+        return f"# Start/Sit: unavailable\n\n{result.error}\n"
+    out = [f"# Start/Sit: {team_name(snap, s.roster_id)}, week {s.week}\n",
+           "| Slot | Player | Pts | Evidence |", "|---|---|---:|---|"]
+    for p in s.slots:
+        if not p.player_id:
+            out.append(f"| {p.slot} | (empty) | 0.0 | |")
+            continue
+        name = player_name(snap.players, p.player_id)
+        if p.locked:
+            out.append(f"| {p.slot} | {name} LOCKED | {p.points:.1f} | `actual · {s.live_as_of}` |")
+        else:
+            c = result.matrix.get(s.week, {}).get(p.player_id)
+            out.append(f"| {p.slot} | {name} | {p.points:.1f} | {_chip(c) if c else ''} |")
+    if s.start or s.sit:
+        out.append(f"\n**Start** {_names(snap, s.start) or '(nobody)'}; **sit** "
+                   f"{_names(snap, s.sit) or '(nobody)'}: {_signed(s.gain)} projected pts.")
+    else:
+        out.append("\nYour current lineup is already the best one.")
+    out.append(f"\nProjected total {s.total:.1f} (locked players at actual points). "
+               f"Statuses as of {snap.build_as_of}; live scores as of {s.live_as_of}.")
+    for wmsg in s.warnings + result.notes:
+        out.append(f"\n> {wmsg}")
+    return "\n".join(out) + "\n"
+
+
+def _roster_cmd(args, kind: str) -> int:
+    import time as _time
+
+    client = make_client()
+    try:
+        snap = build_snapshot(client, args.league_id)
+    except FetchError as e:
+        print(f"Can't reach Sleeper right now: {e}. Try again shortly.", file=sys.stderr)
+        return 2
+    except NoBuild as e:
+        print(f"No projections to work from: {e}.", file=sys.stderr)
+        return 2
+    if not snap.league:
+        print(f"No Sleeper league with id {args.league_id}.", file=sys.stderr)
+        return 1
+    rid = find_roster(snap, client, args.team)
+    if rid is None:
+        teams = ", ".join(f"{r['roster_id']} {team_name(snap, int(r['roster_id']))}"
+                          for r in snap.rosters)
+        print(f"No team matches {args.team!r}. Rosters: {teams}", file=sys.stderr)
+        return 1
+    action = {"type": kind, "roster_id": rid}
+    if kind == "startsit":
+        live = client.matchups(args.league_id, snap.current_week)
+        action |= {"live": next((m for m in live.data or [] if int(m["roster_id"]) == rid), {}),
+                   "live_as_of": dt.datetime.fromtimestamp(live.fetched_at, dt.UTC)
+                   .strftime("%Y-%m-%dT%H:%MZ"), "now": _time.time()}
+    result = evaluate(action, snap.snapshot_id, snapshot=snap)
+    print(render_waivers(result) if kind == "waiver" else render_startsit(result))
+    return 3 if result.error else 0
+
+
+def cmd_waivers(args) -> int:
+    return _roster_cmd(args, "waiver")
+
+
+def cmd_startsit(args) -> int:
+    return _roster_cmd(args, "startsit")
 
 
 def cmd_leagues(args) -> int:
@@ -242,6 +364,12 @@ def main(argv=None) -> int:
     tr.add_argument("--no-court", action="store_true", help="skip the Claude arguments")
     tr.add_argument("--band", type=float, default=BAND, help="verdict band, pts/week")
     tr.set_defaults(func=cmd_trade)
+    for name, fn, text in (("waivers", cmd_waivers, "best free-agent adds and who to drop"),
+                           ("startsit", cmd_startsit, "this week's best lineup")):
+        sp = sub.add_parser(name, help=text)
+        sp.add_argument("league_id")
+        sp.add_argument("--team", required=True, help="Sleeper username or roster number")
+        sp.set_defaults(func=fn)
     dbp = sub.add_parser("db", help="Postgres setup")
     dbp.add_argument("action", choices=["init"])
     dbp.set_defaults(func=cmd_db)

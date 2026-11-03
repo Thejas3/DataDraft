@@ -141,12 +141,16 @@ def _team(snap, pid: str) -> str | None:
     return (snap.players.get(pid) or {}).get("team")
 
 
-def first_week(snap, involved: tuple) -> int:
-    """The current week counts only if the trade clears review before every involved
-    player's game this week. Otherwise the horizon starts next week."""
-    review = snap.settings.get("trade_review_days")
-    review = DEFAULT_REVIEW_DAYS if review is None else int(review)
-    clears = snap.today + dt.timedelta(days=review)
+def first_week(snap, involved: tuple, clears: dt.date | None = None) -> int:
+    """The current week counts only if the move clears (trade review, or a waiver claim
+    processing) before every involved player's game this week. Otherwise the horizon
+    starts next week. `clears` defaults to today + the league's trade review days."""
+    if clears is None:
+        review = snap.settings.get("trade_review_days")
+        review = DEFAULT_REVIEW_DAYS if review is None else int(review)
+        clears = snap.today + dt.timedelta(days=review)
+    else:
+        review = (clears - snap.today).days
     week = snap.current_week
     games = {}
     for g in snap.schedule:
@@ -163,8 +167,15 @@ def first_week(snap, involved: tuple) -> int:
     return week
 
 
-def horizon(snap, involved: tuple) -> tuple:
-    return tuple(range(first_week(snap, involved), snap.last_week() + 1))
+def week_over(snap) -> bool:
+    """Every game of the current week is final; Sleeper rolls the week over a day or two
+    later, so nothing can change this week's lineups anymore."""
+    games = [g for g in snap.schedule if int(g.get("week", 0)) == snap.current_week]
+    return bool(games) and all(g.get("status") == "complete" for g in games)
+
+
+def horizon(snap, involved: tuple, clears: dt.date | None = None) -> tuple:
+    return tuple(range(first_week(snap, involved, clears), snap.last_week() + 1))
 
 
 # ---- lineup math -------------------------------------------------------------------
@@ -219,10 +230,15 @@ class Evaluator:
         best = None
         for drop in itertools.combinations(sorted(after), excess):
             kept = after - set(drop)
-            value = self.total(kept)
-            if best is None or value > best[0] + 1e-9:
-                best = (value, kept, drop)
+            # Most lineup points kept; ties (bench players who never start) drop the
+            # players with the fewest projected points.
+            key = (round(self.total(kept), 6), -round(self.ros(drop), 6))
+            if best is None or key > best[0]:
+                best = (key, kept, drop)
         return best[1], best[2]
+
+    def ros(self, players) -> float:
+        return sum(cell(self.matrix, w, p).points for p in players for w in self.weeks)
 
     def side(self, rid: int, before: frozenset, after: frozenset) -> Side:
         after, drops = self.settle(before, after)

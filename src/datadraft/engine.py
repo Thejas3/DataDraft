@@ -1,15 +1,22 @@
 """The one public entry point (D7): evaluate(action, snapshot_id) -> Result.
 
 The CLI (and later the API) builds or names a snapshot and calls this; nothing outside
-the engine imports the other modules. Milestone 1 supports the "trade" action."""
+the engine imports the other modules. Actions:
+  {"type": "trade", "text": "A, B for C"}
+  {"type": "waiver", "roster_id": N}
+  {"type": "startsit", "roster_id": N, "live": <current-week matchup>, "live_as_of": ISO,
+   "now": epoch seconds}
+Only trades are frozen in the ledger; start/sit reads live fields and is never ledgered."""
 
 from __future__ import annotations
 
+import datetime as dt
 import re
+import time
 from dataclasses import dataclass, field
 
 from . import court, ledger
-from .decide import BAND, Ruling, rule
+from .decide import BAND, Ruling, StartSit, Waivers, rule, start_sit, waivers
 from .delta import Evaluator, Invalid, horizon, parse_trade
 from .lineup import unsupported_slots
 from .projections import GuardError, guard, project
@@ -27,6 +34,9 @@ class Result:
     court: court.CourtResult | None = None
     ledger_key: str = ""
     error: str = ""  # set when no ruling can be made at all (guard tripped)
+    waivers: Waivers | None = None
+    startsit: StartSit | None = None
+    notes: list = field(default_factory=list)  # waiver / start-sit notices
 
 
 def _unsupported(snap: Snapshot, text: str) -> str:
@@ -42,12 +52,86 @@ def _unsupported(snap: Snapshot, text: str) -> str:
     return ""
 
 
+def _matrix(snap: Snapshot, week: int) -> tuple[dict, str, str]:
+    """(matrix, fallback note, error). R3/O5: a failed guard falls back to the baseline in
+    Postgres mode, and pauses in file mode (no baseline)."""
+    matrix = project(snap)
+    try:
+        guard(snap, matrix, week)
+    except GuardError as e:
+        if not snap.nflverse:
+            return matrix, "", f"Projections look wrong today; rulings paused ({e})."
+        return (project(snap, use_sleeper=False),
+                f"Sleeper projections look wrong today ({e}), so every number uses the "
+                "nflverse baseline.", "")
+    return matrix, "", ""
+
+
+NFLVERSE_TO_SLEEPER_TEAM = {"LA": "LAR"}
+
+
+def kickoffs(snap: Snapshot) -> dict:
+    """{sleeper team: kickoff epoch} for the current week, from nflverse schedules
+    (gameday + gametime, US Eastern). Empty in file mode."""
+    sched = (snap.nflverse or {}).get("schedules")
+    if sched is None or "gametime" not in sched.columns:
+        return {}
+    from zoneinfo import ZoneInfo
+
+    et = ZoneInfo("America/New_York")
+    out = {}
+    for week, day, clock, home, away in sched.select(
+            "week", "gameday", "gametime", "home_team", "away_team").iter_rows():
+        if int(week) != snap.current_week or not day or not clock:
+            continue
+        t = dt.datetime.fromisoformat(f"{day}T{clock}").replace(tzinfo=et).timestamp()
+        for team in (home, away):
+            out[NFLVERSE_TO_SLEEPER_TEAM.get(team, team)] = t
+    return out
+
+
+def _status_epoch(snap: Snapshot) -> float | None:
+    try:
+        return dt.datetime.strptime(snap.build_as_of, "%Y-%m-%dT%H:%MZ").replace(
+            tzinfo=dt.UTC).timestamp()
+    except ValueError:
+        return None
+
+
+def _roster_action(action: dict, snap: Snapshot) -> Result:
+    reason = _unsupported(snap, "")
+    if reason:
+        return Result(Ruling("UNSUPPORTED", reason), snap, error=reason)
+    rid = int(action["roster_id"])
+    if not any(int(r["roster_id"]) == rid for r in snap.rosters):
+        return Result(Ruling("INVALID", f"roster {rid} isn't in this league"), snap,
+                      error=f"roster {rid} isn't in this league")
+    if snap.current_week > snap.last_week():
+        return Result(Ruling("INVALID", "season over"), snap, error="the season is over")
+    matrix, fallback, error = _matrix(snap, snap.current_week)
+    if error:
+        return Result(Ruling("INVALID"), snap, matrix, error=error)
+    res = Result(Ruling("INVALID"), snap, matrix)
+    if action["type"] == "waiver":
+        res.waivers = waivers(snap, matrix, rid)
+    else:
+        res.startsit = start_sit(snap, matrix, rid, action.get("live") or {},
+                                 now=action.get("now", time.time()),
+                                 live_as_of=action.get("live_as_of", ""),
+                                 kickoffs=kickoffs(snap), status_as_of=_status_epoch(snap))
+    res.notes = ([fallback] if fallback else []) + list(snap.warnings)
+    return res
+
+
 def evaluate(action: dict, snapshot_id: str, *, snapshot: Snapshot | None = None,
              band: float = BAND, use_court: bool = True, court_client=None,
              freeze: bool = True) -> Result:
-    if action.get("type") != "trade":
-        raise ValueError(f"unsupported action {action.get('type')!r} in Milestone 1")
+    kind = action.get("type")
+    if kind not in ("trade", "waiver", "startsit"):
+        raise ValueError(f"unsupported action {kind!r}")
     snap = snapshot if snapshot is not None else load_snapshot(snapshot_id)
+    if kind != "trade":
+        return _roster_action(action, snap)
     text = action["text"]
 
     reason = _unsupported(snap, text)
@@ -67,17 +151,9 @@ def evaluate(action: dict, snapshot_id: str, *, snapshot: Snapshot | None = None
     if not weeks:  # D10
         return Result(Ruling("INVALID", "season over / no unlocked weeks", band=band), snap)
 
-    matrix = project(snap)
-    fallback = ""
-    try:
-        guard(snap, matrix, weeks[0])
-    except GuardError as e:
-        if not snap.nflverse:  # file mode has no baseline to fall back on (O5)
-            return Result(Ruling("INVALID", band=band), snap, matrix,
-                          error=f"Projections look wrong today; rulings paused ({e}).")
-        matrix = project(snap, use_sleeper=False)  # R3: the baseline covers every cell
-        fallback = (f"Sleeper projections look wrong today ({e}), so every number uses the "
-                    "nflverse baseline.")
+    matrix, fallback, error = _matrix(snap, weeks[0])
+    if error:
+        return Result(Ruling("INVALID", band=band), snap, matrix, error=error)
 
     try:
         ruling = rule(Evaluator(snap, matrix, weeks), trade, band)
