@@ -37,6 +37,8 @@ class Snapshot:
     matchups: list = field(default_factory=list)  # most recent completed week (D19 guard)
     build_id: str = ""  # Postgres mode: the daily build this snapshot sits on (§2)
     warnings: tuple = ()  # shown with the ruling (stale build, players missing from build)
+    nflverse: dict = field(default_factory=dict)  # build's nflverse frames (empty: file mode)
+    xwalk: dict = field(default_factory=dict)  # player_id -> (nflverse_key, match) (D4)
 
     @property
     def snapshot_id(self) -> str:
@@ -128,18 +130,43 @@ def current_build_id(c) -> str:
     return row[0]
 
 
-def _build_players(c, build_id: str) -> dict:
-    return {pid: info for pid, info in c.execute(
-        "select player_id, info from build_players where build_id = %s", (build_id,))}
+def _build_players(c, build_id: str) -> tuple[dict, dict]:
+    players, xwalk = {}, {}
+    for pid, info, key, match in c.execute(
+            "select player_id, info, nflverse_key, match from build_players "
+            "where build_id = %s", (build_id,)):
+        players[pid] = info
+        xwalk[pid] = (key, match)
+    return players, xwalk
 
 
 def _build_projections(c, build_id: str, weeks) -> dict:
+    """Every Sleeper row the build kept, including all-zero ones: a published 0 is still
+    Sleeper's answer and must not fall through to the baseline (§1 precedence)."""
     out: dict = {w: {} for w in weeks}
+    for week, pid, lm in c.execute(
+            "select week, player_id, last_modified from build_projection_rows where "
+            "build_id = %s and week = any(%s) order by week, player_id", (build_id, list(weeks))):
+        out[week][pid] = {"player_id": pid, "week": week, "last_modified": lm, "stats": {}}
     for week, pid, stat, value in c.execute(
             "select week, player_id, stat, value from build_projections where build_id = %s "
             "and week = any(%s) order by week, player_id, stat", (build_id, list(weeks))):
-        out[week].setdefault(pid, {"player_id": pid, "week": week, "stats": {}})["stats"][stat] = value
+        out[week][pid]["stats"][stat] = value
     return {w: list(rows.values()) for w, rows in out.items()}
+
+
+NFLVERSE_IN_SNAPSHOT = ("ff_opportunity", "player_stats", "team_stats", "schedules",
+                        "rosters_weekly", "injury_k")
+
+
+def _build_nflverse(c, build_id: str) -> dict:
+    import io
+
+    import polars as pl
+
+    return {name: pl.read_parquet(io.BytesIO(blob)) for name, blob in c.execute(
+        "select name, parquet from build_tables where build_id = %s and name = any(%s)",
+        (build_id, list(NFLVERSE_IN_SNAPSHOT)))}
 
 
 def from_build(c, build_id: str, client: SleeperClient, league_id: str) -> Snapshot:
@@ -168,7 +195,7 @@ def from_build(c, build_id: str, client: SleeperClient, league_id: str) -> Snaps
     weeks = [w for w in range(current, snap0.last_week() + 1) if w in b_weeks]
     if season != b_season:
         raise NoBuild(f"today's build is for {b_season}, this league is {season}")
-    players = _build_players(c, build_id)
+    players, xwalk = _build_players(c, build_id)
     warnings = []
     rostered = {p for r in rosters.data for p in (r.get("players") or [])}
     missing = sorted(rostered - set(players))
@@ -194,6 +221,8 @@ def from_build(c, build_id: str, client: SleeperClient, league_id: str) -> Snaps
         matchups=matchups.data if matchups else [],
         build_id=build_id,
         warnings=tuple(warnings),
+        nflverse=_build_nflverse(c, build_id),
+        xwalk=xwalk,
     )
 
 
@@ -248,10 +277,11 @@ def _load_from_db(c, snapshot_id: str) -> Snapshot:
     sched = c.execute("select schedule_sha from builds where build_id = %s", (build_id,)).fetchone()
     if sched is None:
         raise NoBuild(f"snapshot {snapshot_id} used build {build_id}, which has been pruned")
+    players, xwalk = _build_players(c, build_id)
     return Snapshot(m["season"], m["current_week"], dt.date.fromisoformat(m["today"]),
                     store.get(shas["league"]), store.get(shas["rosters"]),
-                    store.get(shas["users"]), _build_players(c, build_id),
+                    store.get(shas["users"]), players,
                     _build_projections(c, build_id, m["weeks"]), m["build_as_of"],
                     m["league_as_of"], shas, m["league_stale"], store.get(sched[0]),
                     store.get(shas["matchups"]) if "matchups" in shas else [],
-                    build_id, tuple(m.get("warnings") or ()))
+                    build_id, tuple(m.get("warnings") or ()), _build_nflverse(c, build_id), xwalk)

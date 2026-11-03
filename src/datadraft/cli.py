@@ -7,6 +7,7 @@ With DATABASE_URL set (Milestone 2), rulings sit on the daily build in Postgres:
   datadraft db init                      create the tables
   datadraft pipeline [--league ID ...]   run the daily build (default: DATADRAFT_LEAGUES)
   datadraft status                       show the current build
+  datadraft compare <league_id> [--weeks 6-8]   backtest Sleeper vs the baseline
 
 "A, B for C" means you send A and B and receive C. Your team is whichever roster holds
 A and B, so the same command works for anyone in the league."""
@@ -202,6 +203,31 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_compare(args) -> int:
+    from .backtest import compare
+    from .backtest import render as render_backtest
+
+    if not _need_db():
+        return 1
+    client = make_client()
+    try:
+        snap = build_snapshot(client, args.league_id)
+    except (FetchError, NoBuild) as e:
+        print(f"Can't build a snapshot: {e}", file=sys.stderr)
+        return 2
+    if not snap.league:
+        print(f"No Sleeper league with id {args.league_id}.", file=sys.stderr)
+        return 1
+    lo, _, hi = args.weeks.partition("-")
+    weeks = list(range(int(lo), int(hi or lo) + 1))
+    if weeks[-1] >= snap.current_week:
+        print(f"Week {weeks[-1]} isn't finished yet (current week {snap.current_week}).",
+              file=sys.stderr)
+        return 1
+    print(render_backtest(compare(snap, client, weeks)))
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="datadraft", description="NFL fantasy trade rulings "
                                 "for Sleeper leagues.")
@@ -224,6 +250,10 @@ def main(argv=None) -> int:
     pl.set_defaults(func=cmd_pipeline)
     st = sub.add_parser("status", help="show the current daily build")
     st.set_defaults(func=cmd_status)
+    cp = sub.add_parser("compare", help="backtest Sleeper projections vs the baseline")
+    cp.add_argument("league_id")
+    cp.add_argument("--weeks", default="6-8", help="finished weeks, e.g. 6-8")
+    cp.set_defaults(func=cmd_compare)
     args = p.parse_args(argv)
     return args.func(args)
 

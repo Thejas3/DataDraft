@@ -11,7 +11,7 @@ import uuid
 import polars as pl
 import pytest
 
-from conftest import from_recorded
+from conftest import from_recorded, nfl_frames
 from datadraft import db
 from datadraft.engine import evaluate
 from datadraft.ingest import FetchError, SleeperClient, crosswalk
@@ -78,14 +78,31 @@ class FakeSleeper(SleeperClient):
 
 
 def fake_nflverse(season):
-    return {
-        "schedules": pl.DataFrame({"home_team": ["CAR", "LA"], "away_team": ["CHI", "ARI"]}),
-        "injuries": pl.DataFrame({"gsis_id": ["00-1"], "report_status": ["Out"]}),
-        "ff_opportunity": pl.DataFrame({"player_id": ["00-1"], "week": [7]}),
-        "player_stats": pl.DataFrame({"player_id": ["00-1"], "week": [7]}),
-        "team_stats": pl.DataFrame({"team": ["CAR"], "week": [7]}),
-        "ff_playerids": pl.DataFrame({"sleeper_id": [5995, None], "gsis_id": ["00-1", "00-2"]}),
-    }
+    f = nfl_frames(season=season, opportunity=[("00-1", 7, {"receptions_exp": 3.0})],
+                   team_games=[("g1", 7, "CAR", "CHI", 20, 17, {}),
+                               ("g2", 7, "LA", "ARI", 10, 3, {})])
+    del f["injury_k"]
+    f["injuries"] = pl.DataFrame({"gsis_id": ["00-1"], "report_status": ["Out"]})
+    f["ff_playerids"] = pl.DataFrame({"sleeper_id": [5995, None], "gsis_id": ["00-1", "00-2"]})
+    return f
+
+
+HISTORY_CALLS = []
+
+
+def fake_history(season):
+    """Two short OUT absences and a 2-game IR stint: k stays at or under file mode's
+    numbers, so Postgres and file mode must agree on the recorded league."""
+    HISTORY_CALLS.append(season)
+    inj = pl.DataFrame({"season": [2024, 2024], "week": [3, 9], "game_type": ["REG", "REG"],
+                        "gsis_id": ["a", "b"], "position": ["WR", "RB"],
+                        "report_status": ["Out", "Out"],
+                        "report_primary_injury": ["Ankle", "Knee"]})
+    rw = pl.DataFrame({"season": [2024] * 8, "week": [2, 3, 4, 8, 9, 10, 11, 12],
+                       "game_type": ["REG"] * 8, "gsis_id": ["a"] * 3 + ["b"] * 5,
+                       "position": ["WR"] * 3 + ["RB"] * 5,
+                       "status": ["ACT", "INA", "ACT", "ACT", "INA", "RES", "RES", "ACT"]})
+    return inj, rw
 
 
 class Clock:
@@ -99,7 +116,8 @@ class Clock:
 def build(pg, recorded_raw, clock=None):
     clock = clock or Clock()
     client = FakeSleeper(db.PgPayloadStore(pg), recorded_raw, clock)
-    return client, run_daily(pg, client, ["fixture"], nflverse=fake_nflverse, now=clock)
+    return client, run_daily(pg, client, ["fixture"], nflverse=fake_nflverse,
+                             history=fake_history, now=clock)
 
 
 def current(pg):
@@ -180,3 +198,29 @@ def test_crosswalk_matches_gsis_def_by_team_and_flags_the_rest():
     assert crosswalk(players, ids, {"CAR", "CHI", "LA"}) == {
         "5995": ("00-1", "gsis"), "LAR": ("LA", "team"), "17": ("CHI", "team"),
         "42": (None, None)}
+
+
+def test_injury_k_is_computed_once_per_season_and_pinned_in_the_build(pg, recorded_raw):
+    HISTORY_CALLS.clear()
+    client, _ = build(pg, recorded_raw)
+    build(pg, recorded_raw, Clock(DAY + 86400))
+    assert HISTORY_CALLS == [2026]  # the second build reused the first build's table
+    snap = build_snapshot(client, "fixture")
+    k = {(d, c): v for d, c, v in snap.nflverse["injury_k"].select(
+        "designation", "category", "k").iter_rows()}
+    assert k[("OUT", "ankle")] == 1 and k[("OUT", "knee")] == 3  # INA, RES, RES
+    assert snap.xwalk["5995"] == ("00-1", "gsis")
+
+
+def test_status_since_marks_the_first_day_of_the_current_status(pg, recorded_raw):
+    from datadraft.pipeline import status_since
+
+    raw = copy.deepcopy(recorded_raw)
+    pid = raw["rosters"][0]["players"][0]
+    client, _ = build(pg, raw)  # day 1: healthy
+    raw["players"][pid]["injury_status"] = "IR"
+    build(pg, raw, Clock(DAY + 86400))
+    build(pg, raw, Clock(DAY + 2 * 86400))
+    assert status_since(pg, {pid: "IR"}) == {pid: "2026-10-30"}
+    snap = build_snapshot(client, "fixture")
+    assert snap.players[pid]["status_since"] == "2026-10-30"

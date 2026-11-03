@@ -31,7 +31,15 @@ datadraft db init
 datadraft pipeline                            # once a day, ~08:00 UTC
 datadraft status                              # current build, age, guard result
 datadraft trade <league_id> "A, B for C"
+datadraft compare <league_id> --weeks 6-8     # backtest Sleeper vs the baseline
 ```
+
+In this mode, a player-week Sleeper didn't project uses an nflverse baseline instead:
+expected stats from the last 4 games blended with season to date, or a trailing
+average for K and DEF. If Sleeper's projections fail the daily sanity check, the
+baseline covers every cell and the ruling says so. Injured players are zeroed for
+the typical absence for their body part, learned from injury reports since 2015, and
+IR players for at least the rest of the 4-game minimum.
 
 A build is published only after it passes validation, and the previous build stays
 current if a day fails. The last 14 builds are kept. Projections older than 30 h show a

@@ -68,11 +68,16 @@ def evaluate(action: dict, snapshot_id: str, *, snapshot: Snapshot | None = None
         return Result(Ruling("INVALID", "season over / no unlocked weeks", band=band), snap)
 
     matrix = project(snap)
+    fallback = ""
     try:
         guard(snap, matrix, weeks[0])
     except GuardError as e:
-        return Result(Ruling("INVALID", band=band), snap, matrix,
-                      error=f"Projections look wrong today; rulings paused ({e}).")
+        if not snap.nflverse:  # file mode has no baseline to fall back on (O5)
+            return Result(Ruling("INVALID", band=band), snap, matrix,
+                          error=f"Projections look wrong today; rulings paused ({e}).")
+        matrix = project(snap, use_sleeper=False)  # R3: the baseline covers every cell
+        fallback = (f"Sleeper projections look wrong today ({e}), so every number uses the "
+                    "nflverse baseline.")
 
     try:
         ruling = rule(Evaluator(snap, matrix, weeks), trade, band)
@@ -81,6 +86,8 @@ def evaluate(action: dict, snapshot_id: str, *, snapshot: Snapshot | None = None
     if snap.league_stale:
         ruling.notes.append(f"Rosters as of {snap.league_as_of}: Sleeper didn't respond, "
                             "so this uses the last stored copy.")
+    if fallback:
+        ruling.notes.append(fallback)
     ruling.notes.extend(snap.warnings)
     result = Result(ruling, snap, matrix)
     if use_court:

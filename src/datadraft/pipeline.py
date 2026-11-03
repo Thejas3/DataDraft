@@ -17,7 +17,8 @@ import time
 from dataclasses import dataclass, field
 
 from . import db
-from .ingest import SleeperClient, crosswalk, load_nflverse, nflverse_team
+from .ingest import (HISTORY_SINCE, SleeperClient, crosswalk, load_injury_history,
+                     load_nflverse, nflverse_team)
 
 MAX_WEEK = 18
 KEEP_BUILDS = 14  # D5
@@ -53,7 +54,7 @@ def _parquet(frame) -> bytes:
 
 
 def run_daily(c, client: SleeperClient, league_ids: list[str], *, nflverse=load_nflverse,
-              now=time.time) -> BuildReport:
+              history=load_injury_history, now=time.time) -> BuildReport:
     if not league_ids:
         raise BuildError("no leagues to build for: pass --league or set DATADRAFT_LEAGUES")
     state = client.state()
@@ -70,7 +71,11 @@ def run_daily(c, client: SleeperClient, league_ids: list[str], *, nflverse=load_
     schedule = client.schedule(season)
     weeks = list(range(week, MAX_WEEK + 1))
     proj = {w: client.projections(season, w) for w in weeks}
-    frames = nflverse(int(season))
+    frames = dict(nflverse(int(season)))
+    frames["injury_k"] = _injury_k(c, season, history)
+    # Archive today's statuses first: status_since below must see today's row, and the
+    # archive records what Sleeper said even on a day the build fails validation.
+    archive_statuses(c, players.data, now())
     teams = set(frames["schedules"]["home_team"].to_list()) | \
         set(frames["schedules"]["away_team"].to_list())
 
@@ -83,6 +88,8 @@ def run_daily(c, client: SleeperClient, league_ids: list[str], *, nflverse=load_
     keep = sorted((rostered | projected) & set(players.data))
     info = {p: {k: players.data[p].get(k) for k in KEEP_PLAYER if k in players.data[p]}
             for p in keep}
+    for pid, since in status_since(c, {p: info[p].get("injury_status") for p in keep}).items():
+        info[pid]["status_since"] = since
     xw = crosswalk(info, frames["ff_playerids"], teams)
     unmatched = sorted(p for p, (key, _) in xw.items() if key is None and p in rostered)
 
@@ -143,7 +150,6 @@ def run_daily(c, client: SleeperClient, league_ids: list[str], *, nflverse=load_
         c.execute("insert into current_build (one, build_id) values (true, %s) "
                   "on conflict (one) do update set build_id = excluded.build_id, "
                   "flipped_at = now()", (build_id,))
-    archive_statuses(c, players.data, now())
     pruned = prune(c, now())
     return BuildReport(build_id, weeks, counts, guard, unmatched, pruned)
 
@@ -177,6 +183,47 @@ def _guard(c, client, build_id, league_id, league, rosters) -> str:
         return "ok"
     except GuardError as e:
         return str(e)
+
+
+def _injury_k(c, season: str, history):
+    """§5 k table. It depends only on past seasons, so reuse the current build's copy when
+    it was made for the same season; otherwise load 10+ seasons of history once."""
+    import polars as pl
+
+    row = c.execute("select t.parquet from current_build cb join builds b using (build_id) "
+                    "join build_tables t using (build_id) where t.name = 'injury_k' "
+                    "and b.season = %s", (season,)).fetchone()
+    if row:
+        return pl.read_parquet(io.BytesIO(row[0]))
+    from .projections import injury_k
+
+    inj, rw = history(int(season))
+    return injury_k(inj, rw, HISTORY_SINCE)
+
+
+def status_since(c, current: dict) -> dict:
+    """{player_id: 'YYYY-MM-DD'}: the first archived day of each injured player's current
+    status. Omitted when the run reaches the archive's first day (true start unknown)."""
+    hurt = [p for p, st in current.items() if st]
+    if not hurt:
+        return {}
+    first_day = c.execute("select min(day) from status_archive").fetchone()[0]
+    out = {}
+    rows = c.execute("select player_id, day, injury_status from status_archive where "
+                     "player_id = any(%s) order by player_id, day desc", (hurt,)).fetchall()
+    run: dict = {}
+    for pid, day, st in rows:
+        state = run.setdefault(pid, {"open": True, "since": None})
+        if not state["open"]:
+            continue
+        if st == current[pid]:
+            state["since"] = day
+        else:
+            state["open"] = False
+    for pid, state in run.items():
+        if state["since"] is not None and (not state["open"] or state["since"] > first_day):
+            out[pid] = state["since"].isoformat()
+    return out
 
 
 def archive_statuses(c, players: dict, ts: float) -> int:

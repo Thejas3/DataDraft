@@ -136,6 +136,11 @@ class SleeperClient:
         # The full dump is ~5 MB; Sleeper asks callers to fetch it at most once a day.
         return self._get("/v1/players/nfl", max_age=24 * 3600)
 
+    def stats(self, season: str, week: int) -> Fetched:
+        """Actual weekly stat lines, same shape as projections (backtests only)."""
+        pos = "&".join(f"position[]={p}" for p in PROJECTION_POSITIONS)
+        return self._get(f"/stats/nfl/{season}/{week}?season_type=regular&{pos}", max_age=6 * 3600)
+
     def projections(self, season: str, week: int) -> Fetched:
         pos = "&".join(f"position[]={p}" for p in PROJECTION_POSITIONS)
         return self._get(
@@ -160,8 +165,27 @@ def load_nflverse(season: int) -> dict:
         "ff_opportunity": nfl.load_ff_opportunity(season),
         "player_stats": nfl.load_player_stats(season),
         "team_stats": nfl.load_team_stats(season),
+        "rosters_weekly": nfl.load_rosters_weekly(season),
         "ff_playerids": nfl.load_ff_playerids(),
     }
+
+
+HISTORY_SINCE = 2015
+
+
+def load_injury_history(season: int):
+    """(injury reports, weekly rosters) for HISTORY_SINCE..season-1: the §5 k table input."""
+    import polars as pl
+    import nflreadpy as nfl
+
+    seasons = list(range(HISTORY_SINCE, season))
+    cols_i = ["season", "week", "game_type", "gsis_id", "position", "report_status",
+              "report_primary_injury"]
+    cols_r = ["season", "week", "game_type", "gsis_id", "position", "status"]
+    inj = pl.concat([nfl.load_injuries(s).select(cols_i) for s in seasons], how="vertical_relaxed")
+    rw = pl.concat([nfl.load_rosters_weekly(s).select(cols_r) for s in seasons],
+                   how="vertical_relaxed")
+    return inj, rw
 
 
 def nflverse_team(team: str | None) -> str | None:

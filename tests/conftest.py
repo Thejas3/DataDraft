@@ -82,3 +82,60 @@ def recorded(recorded_raw) -> Snapshot:
 
 def replace(snap, **kw):
     return dataclasses.replace(snap, **kw)
+
+
+# --- nflverse fakes with the real column names the baseline reads ---------------------
+
+def nfl_frames(*, season=2026, opportunity=(), player_stats=(), team_games=(), schedules=(),
+               rosters_weekly=(), injury_k=()):
+    """Small nflverse tables. opportunity rows: (gsis, week, {exp_col: value});
+    player_stats rows: (gsis, week, {col: value}); team_games: (game_id, week, home, away,
+    home_score, away_score, {team: {col: value}}); injury_k: (designation, category, n, k)."""
+    import polars as pl
+
+    from datadraft.projections import EXPECTED
+
+    opp = [{"season": season, "week": float(w), "player_id": g, "posteam": "AAA",
+            **{c: 0.0 for c in EXPECTED.values()}, **vals} for g, w, vals in opportunity]
+    ps_cols = ["sack_fumbles_lost", "rushing_fumbles_lost", "receiving_fumbles_lost",
+               "passing_2pt_conversions", "rushing_2pt_conversions", "receiving_2pt_conversions",
+               "fg_made", "fg_att", "fg_missed", "fg_made_0_19", "fg_made_20_29", "fg_made_30_39",
+               "fg_made_40_49", "fg_made_50_59", "fg_made_60_", "fg_missed_0_19",
+               "fg_missed_20_29", "fg_missed_30_39", "fg_missed_40_49", "fg_missed_50_59",
+               "fg_missed_60_", "fg_made_distance", "pat_made", "pat_missed", "pat_att"]
+    ps = [{"player_id": g, "season": season, "week": w, "season_type": "REG",
+           **{c: 0 for c in ps_cols}, **vals} for g, w, vals in player_stats]
+    ts_cols = ["def_sacks", "def_interceptions", "fumble_recovery_opp", "def_tds",
+               "def_safeties", "def_fumbles_forced", "def_fg_blocks", "def_punt_blocks",
+               "special_teams_tds", "passing_yards", "sack_yards_lost", "rushing_yards"] + ps_cols
+    ts, sched = [], []
+    for gid, w, home, away, hs, as_, stats in team_games:
+        sched.append({"game_id": gid, "week": w, "home_team": home, "away_team": away,
+                      "home_score": hs, "away_score": as_})
+        for team in (home, away):
+            ts.append({"season": season, "week": w, "team": team, "season_type": "REG",
+                       "game_id": gid, **{c: 0 for c in ts_cols}, **stats.get(team, {})})
+    sched += [dict(s) for s in schedules]
+
+    text = {"player_id", "season_type", "game_id", "team", "home_team", "away_team",
+            "gsis_id", "status", "game_type", "position", "posteam", "designation", "category"}
+
+    def frame(rows, cols):
+        if rows:
+            return pl.DataFrame(rows)
+        return pl.DataFrame(schema={c: pl.Utf8 if c in text else pl.Float64 for c in cols})
+
+    return {
+        "ff_opportunity": frame(opp, ["season", "week", "player_id", *EXPECTED.values()]),
+        "player_stats": frame(ps, ["player_id", "season", "week", "season_type", *ps_cols]),
+        "team_stats": frame(ts, ["season", "week", "team", "season_type", "game_id", *ts_cols]),
+        "schedules": frame(sched, ["game_id", "week", "home_team", "away_team", "home_score",
+                                   "away_score"]),
+        "rosters_weekly": frame([{"season": season, "week": w, "gsis_id": g, "status": s,
+                                  "game_type": "REG", "position": "WR"}
+                                 for g, w, s in rosters_weekly],
+                                ["season", "week", "gsis_id", "status", "game_type", "position"]),
+        "injury_k": frame([{"designation": d, "category": c, "n": n, "k": k, "since": 2015}
+                           for d, c, n, k in injury_k],
+                          ["designation", "category", "n", "k", "since"]),
+    }
