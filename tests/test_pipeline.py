@@ -161,6 +161,9 @@ def test_stale_build_and_missing_players_warn(pg, recorded_raw):
     client, _ = build(pg, recorded_raw)
     pg.execute("delete from build_players where player_id = %s",
                (recorded_raw["rosters"][0]["players"][0],))
+    from datadraft.engine import clear_caches
+
+    clear_caches()  # we edited a published build by hand; production never does (D5)
     client.now = Clock(DAY + 31 * 3600)
     snap = build_snapshot(client, "fixture")
     assert any("stale" in w for w in snap.warnings)

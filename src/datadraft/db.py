@@ -91,6 +91,24 @@ create table if not exists snapshots (
     created_at timestamptz not null default now(),
     manifest jsonb not null
 );
+create table if not exists rulings (
+    slug text primary key,  -- 128-bit random, unlisted (§ Access control)
+    league_id text not null,
+    snapshot_id text not null,
+    ledger_key text,
+    action jsonb not null,
+    body jsonb not null,  -- the ruling as the API serves it
+    court jsonb,  -- filled by the second, progressive call (D30)
+    created_at timestamptz not null default now()
+);
+create index if not exists rulings_league on rulings (league_id, created_at desc);
+create table if not exists api_events (
+    kind text not null,  -- 'ruling' (rate limit) | 'llm' (spend cap) | 'login_fail'
+    key text not null,  -- league id, or client address for login failures
+    at timestamptz not null default now(),
+    cost_usd double precision not null default 0
+);
+create index if not exists api_events_kind on api_events (kind, key, at);
 create table if not exists ledger (
     key text primary key,
     frozen_at double precision not null,
@@ -99,7 +117,9 @@ create table if not exists ledger (
 );
 """
 
-_conn = None
+import threading
+
+_local = threading.local()  # one connection per thread: the API serves from a pool
 
 
 def url() -> str:
@@ -117,17 +137,16 @@ def connect(dsn: str | None = None):
 
 
 def conn():
-    """The process-wide connection. Writes that must be atomic use conn.transaction()."""
-    global _conn
-    if _conn is None or _conn.closed:
-        _conn = connect()
-    return _conn
+    """This thread's connection. Writes that must be atomic use conn.transaction()."""
+    c = getattr(_local, "conn", None)
+    if c is None or c.closed:
+        c = _local.conn = connect()
+    return c
 
 
 def use(connection) -> None:
-    """Point the process at an existing connection (tests, the pipeline)."""
-    global _conn
-    _conn = connection
+    """Point this thread at an existing connection (tests, the pipeline)."""
+    _local.conn = connection
 
 
 def init(c=None) -> None:

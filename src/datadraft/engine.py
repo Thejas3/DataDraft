@@ -11,16 +11,23 @@ Only trades are frozen in the ledger; start/sit reads live fields and is never l
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import re
 import time
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from . import court, ledger
 from .decide import BAND, Ruling, StartSit, Waivers, rule, start_sit, waivers
-from .delta import Evaluator, Invalid, horizon, parse_trade
+from .delta import Evaluator, Invalid, horizon, parse_trade, player_name, trade_from_ids
 from .lineup import unsupported_slots
-from .projections import GuardError, guard, project
+from .projections import Availability, GuardError, guard, positions, project
 from .snapshot import Snapshot, load_snapshot
+
+__all__ = ["evaluate", "Result", "BAND", "player_name", "positions", "player_profile",
+           "copy_dm", "clear_caches"]
 
 LEAGUE_TYPES = {0: "redraft", 1: "keeper", 2: "dynasty"}
 PICK_OR_FAAB = re.compile(r"\b(pick|round|rd|1st|2nd|3rd|faab)\b|\$", re.I)
@@ -37,6 +44,7 @@ class Result:
     waivers: Waivers | None = None
     startsit: StartSit | None = None
     notes: list = field(default_factory=list)  # waiver / start-sit notices
+    evidence: list = field(default_factory=list)  # court bundle: [{id, label, value}]
 
 
 def _unsupported(snap: Snapshot, text: str) -> str:
@@ -52,19 +60,94 @@ def _unsupported(snap: Snapshot, text: str) -> str:
     return ""
 
 
+_MATRICES: "OrderedDict[tuple, tuple]" = OrderedDict()
+MATRIX_CACHE = 8  # a few leagues x the current and previous build
+_LOCK = threading.Lock()
+
+
+def _matrix_key(snap: Snapshot, week: int):
+    """D14: builds are immutable once published, so a matrix is a pure function of the
+    build and the league inputs project() reads. Rosters don't enter it. File-mode
+    snapshots have no build id and are never cached."""
+    if not snap.build_id:
+        return None
+    league = json.dumps([snap.scoring, snap.current_week, sorted(snap.projections), week,
+                         snap.payload_shas.get("state")], sort_keys=True)
+    return snap.build_id, hashlib.sha256(league.encode()).hexdigest()
+
+
 def _matrix(snap: Snapshot, week: int) -> tuple[dict, str, str]:
     """(matrix, fallback note, error). R3/O5: a failed guard falls back to the baseline in
     Postgres mode, and pauses in file mode (no baseline)."""
+    key = _matrix_key(snap, week)
+    with _LOCK:
+        if key is not None and key in _MATRICES:
+            _MATRICES.move_to_end(key)
+            return _MATRICES[key]
     matrix = project(snap)
+    out = (matrix, "", "")
     try:
         guard(snap, matrix, week)
     except GuardError as e:
         if not snap.nflverse:
-            return matrix, "", f"Projections look wrong today; rulings paused ({e})."
-        return (project(snap, use_sleeper=False),
-                f"Sleeper projections look wrong today ({e}), so every number uses the "
-                "nflverse baseline.", "")
-    return matrix, "", ""
+            out = (matrix, "", f"Projections look wrong today; rulings paused ({e}).")
+        else:
+            out = (project(snap, use_sleeper=False),
+                   f"Sleeper projections look wrong today ({e}), so every number uses the "
+                   "nflverse baseline.", "")
+    if key is not None:
+        with _LOCK:
+            _MATRICES[key] = out
+            while len(_MATRICES) > MATRIX_CACHE:
+                _MATRICES.popitem(last=False)
+    return out
+
+
+def clear_caches() -> None:
+    from . import snapshot
+
+    with _LOCK:
+        _MATRICES.clear()
+    snapshot.clear_caches()
+
+
+def player_profile(snap: Snapshot, pid: str) -> dict | None:
+    """Projections by week with their sources, the §5 estimated-return note (the same
+    function the math uses), and this season's weekly nflverse usage."""
+    info = snap.players.get(pid)
+    if info is None:
+        return None
+    matrix, fallback, _ = _matrix(snap, snap.current_week)
+    weeks = []
+    for w in sorted(matrix):
+        c = matrix[w].get(pid)
+        if c is not None:
+            weeks.append({"week": w, "points": c.points, "source": c.source,
+                          "availability": c.availability, "approx": c.approx})
+    key, match = snap.xwalk.get(pid) or (None, None)
+    usage = []
+    ps = (snap.nflverse or {}).get("player_stats")
+    if ps is not None and match == "gsis":
+        cols = [c for c in ("week", "targets", "receptions", "receiving_yards", "carries",
+                            "rushing_yards", "attempts", "passing_yards", "fantasy_points_ppr")
+                if c in ps.columns]
+        usage = ps.filter(ps["player_id"] == key).sort("week").select(cols).to_dicts()
+    a = Availability(snap).absence(pid)
+    return {"player_id": pid, "name": player_name(snap.players, pid),
+            "positions": sorted(positions(snap.players, pid)), "team": info.get("team"),
+            "injury_status": info.get("injury_status"),
+            "injury_body_part": info.get("injury_body_part"),
+            "status_as_of": snap.build_as_of, "estimated_return": a.note or None,
+            "nflverse_match": bool(key), "projections": weeks, "usage": usage,
+            "notes": [fallback] if fallback else []}
+
+
+def copy_dm(snap: Snapshot, c) -> str:
+    """§4: a template over the counteroffer's numbers, not LLM prose."""
+    names = lambda ps: ", ".join(player_name(snap.players, p) for p in ps)  # noqa: E731
+    return (f"Would you do {names(c.trade.give)} for {names(c.trade.get)}? "
+            f"By my projections it's about {c.them.delta:+.1f} pts/wk for your lineup "
+            f"through the playoffs.")
 
 
 NFLVERSE_TO_SLEEPER_TEAM = {"LA": "LAR"}
@@ -125,14 +208,14 @@ def _roster_action(action: dict, snap: Snapshot) -> Result:
 
 def evaluate(action: dict, snapshot_id: str, *, snapshot: Snapshot | None = None,
              band: float = BAND, use_court: bool = True, court_client=None,
-             freeze: bool = True) -> Result:
+             freeze: bool = True, court_budget_usd: float | None = None) -> Result:
     kind = action.get("type")
     if kind not in ("trade", "waiver", "startsit"):
         raise ValueError(f"unsupported action {kind!r}")
     snap = snapshot if snapshot is not None else load_snapshot(snapshot_id)
     if kind != "trade":
         return _roster_action(action, snap)
-    text = action["text"]
+    text = action.get("text", "")
 
     reason = _unsupported(snap, text)
     if reason:
@@ -144,7 +227,8 @@ def evaluate(action: dict, snapshot_id: str, *, snapshot: Snapshot | None = None
     if int(snap.settings.get("disable_trades") or 0):
         return Result(Ruling("INVALID", "trades are disabled in this league", band=band), snap)
     try:
-        trade = parse_trade(snap, text)
+        trade = trade_from_ids(snap, action["give"], action["get"]) if "give" in action \
+            else parse_trade(snap, text)
     except Invalid as e:
         return Result(Ruling("INVALID", str(e), band=band), snap)
     weeks = horizon(snap, trade.give + trade.get)
@@ -167,7 +251,9 @@ def evaluate(action: dict, snapshot_id: str, *, snapshot: Snapshot | None = None
     ruling.notes.extend(snap.warnings)
     result = Result(ruling, snap, matrix)
     if use_court:
-        result.court = court.argue(snap, matrix, ruling, client=court_client)
+        result.court = court.argue(snap, matrix, ruling, client=court_client,
+                                   budget_usd=court_budget_usd)
+        result.evidence = court.bundle(snap, matrix, ruling)
     if freeze:
         result.ledger_key = ledger.freeze(action, snapshot_id, snap.league.get("league_id", ""),
                                           ruling)

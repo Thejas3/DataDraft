@@ -10,6 +10,7 @@ With DATABASE_URL set (Milestone 2), rulings sit on the daily build in Postgres:
   datadraft pipeline [--league ID ...]   run the daily build (default: DATADRAFT_LEAGUES)
   datadraft status                       show the current build
   datadraft compare <league_id> [--weeks 6-8]   backtest Sleeper vs the baseline
+  datadraft serve [--port 8000]          the HTTP API (needs DATADRAFT_PASSPHRASE/SECRET)
 
 "A, B for C" means you send A and B and receive C. Your team is whichever roster holds
 A and B, so the same command works for anyone in the league."""
@@ -23,9 +24,7 @@ import sys
 
 from . import db
 
-from .decide import BAND
-from .delta import TradeDelta, player_name
-from .engine import evaluate
+from .engine import BAND, copy_dm, evaluate, player_name
 from .ingest import FetchError, PayloadStore, SleeperClient, data_dir
 from .snapshot import NoBuild, build_snapshot
 
@@ -50,14 +49,7 @@ def _signed(x: float) -> str:
     return f"{x:+.1f}"
 
 
-def copy_dm(snap, c: TradeDelta) -> str:
-    """§4: a template over the counteroffer's numbers, not LLM prose."""
-    return (f"Would you do {_names(snap, c.trade.give)} for {_names(snap, c.trade.get)}? "
-            f"By my projections it's about {_signed(c.them.delta)} pts/wk for your lineup "
-            f"through the playoffs.")
-
-
-def _delta_table(snap, d: TradeDelta) -> list[str]:
+def _delta_table(snap, d) -> list[str]:
     them = team_name(snap, d.trade.them)
     lines = ["| | You | " + them + " |", "|---|---:|---:|",
              f"| Lineup change, pts/week | **{_signed(d.me.delta)}** | {_signed(d.them.delta)} |"]
@@ -350,6 +342,13 @@ def cmd_compare(args) -> int:
     return 0
 
 
+def cmd_serve(args) -> int:
+    from .api import serve
+
+    serve(args.host, args.port)
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="datadraft", description="NFL fantasy trade rulings "
                                 "for Sleeper leagues.")
@@ -382,6 +381,10 @@ def main(argv=None) -> int:
     cp.add_argument("league_id")
     cp.add_argument("--weeks", default="6-8", help="finished weeks, e.g. 6-8")
     cp.set_defaults(func=cmd_compare)
+    sv = sub.add_parser("serve", help="run the HTTP API")
+    sv.add_argument("--host", default="127.0.0.1")
+    sv.add_argument("--port", type=int, default=8000)
+    sv.set_defaults(func=cmd_serve)
     args = p.parse_args(argv)
     return args.func(args)
 

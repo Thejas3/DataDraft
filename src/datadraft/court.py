@@ -18,6 +18,16 @@ from .projections import cell
 
 MODEL = os.environ.get("DATADRAFT_MODEL", "claude-opus-5-5")
 MAX_CALLS = 3  # one call plus up to 2 regenerations
+MAX_TOKENS = 4000
+# $ per million tokens: (input, output, cache read). 5-minute cache writes cost 1.25x
+# input. A refusal fallback is billed at the serving model's rates, so price by
+# response.model; unknown models use the most expensive row, so the cap errs safe.
+PRICES = {"claude-opus-5-5": (4.0, 20.0, 0.20), "claude-opus-5": (5.0, 25.0, 0.50),
+          "claude-opus-4-8": (5.0, 25.0, 0.50), "claude-sonnet-5-5": (2.0, 10.0, 0.20),
+          "claude-fable-5-1": (10.0, 50.0, 0.25)}
+PRICE_UNKNOWN = (10.0, 50.0, 1.0)
+CAP_NOTICE = "Arguments unavailable today (the daily spend cap was reached). " \
+             "The ruling and numbers are unaffected."
 PLACEHOLDER = re.compile(r"\{(E\d+)\}")
 WHITELIST = re.compile(r"\b(?:QB|RB|WR|TE|K|DEF|FLEX)\d{1,2}\b|\b\d-for-\d\b")
 WITHHELD = "Some arguments were withheld because they could not be sourced."
@@ -64,6 +74,26 @@ class CourtResult:
     arguments: dict = field(default_factory=dict)  # section -> [Argument]
     notice: str = ""
     calls: int = 0
+    cost_usd: float = 0.0
+
+
+def call_cost(resp) -> float:
+    """Dollar cost of one response from its usage block."""
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return 0.0
+    inp, out, read = PRICES.get(getattr(resp, "model", MODEL), PRICE_UNKNOWN)
+    g = lambda k: float(getattr(usage, k, 0) or 0)  # noqa: E731
+    return (g("input_tokens") * inp + g("output_tokens") * out
+            + g("cache_read_input_tokens") * read
+            + g("cache_creation_input_tokens") * inp * 1.25) / 1e6
+
+
+def worst_case_cost(messages: list, system: str) -> float:
+    """An upper bound before a call: ~3 characters per token in, max_tokens out."""
+    inp, out, _ = PRICES.get(MODEL, PRICE_UNKNOWN)
+    chars = len(system) + sum(len(str(m["content"])) for m in messages)
+    return (chars / 3 * inp + MAX_TOKENS * out) / 1e6
 
 
 # ---- evidence bundle ---------------------------------------------------------------
@@ -170,7 +200,9 @@ def _prompt(snap, ruling, items) -> str:
     )
 
 
-def argue(snap, matrix, ruling, client=None) -> CourtResult:
+def argue(snap, matrix, ruling, client=None, budget_usd: float | None = None) -> CourtResult:
+    """budget_usd: what's left of today's LLM spend cap; a call starts only if its worst
+    case fits, so the cap is never exceeded. None means no cap (the CLI)."""
     items = bundle(snap, matrix, ruling)
     ids = {i["id"] for i in items}
     if client is None:
@@ -183,16 +215,24 @@ def argue(snap, matrix, ruling, client=None) -> CourtResult:
     result = CourtResult()
     passed: dict = {}
     for attempt in range(MAX_CALLS):
+        if budget_usd is not None and \
+                result.cost_usd + worst_case_cost(messages, SYSTEM) > budget_usd:
+            result.notice = CAP_NOTICE if attempt == 0 else WITHHELD
+            break
         result.calls += 1
         try:
-            resp = client.messages.create(
-                model=MODEL, max_tokens=4000, system=SYSTEM, messages=messages,
+            # Server-side refusal fallback: a declined request is re-run on a model
+            # chosen by refusal category, inside the same call.
+            resp = client.beta.messages.create(
+                model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM, messages=messages,
                 output_config={"format": {"type": "json_schema", "schema": SCHEMA}},
+                betas=["server-side-fallback-2026-07-01"], fallbacks="default",
             )
         except Exception as e:  # network, auth, rate limit: the ruling still renders
             result.notice = f"Court arguments unavailable ({type(e).__name__}). " \
                             "The ruling and numbers are unaffected."
             break
+        result.cost_usd += call_cost(resp)
         if resp.stop_reason == "refusal":
             result.notice = "Court arguments unavailable (the model declined)."
             break

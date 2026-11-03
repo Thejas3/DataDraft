@@ -7,6 +7,8 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from . import db
@@ -186,6 +188,38 @@ def _build_nflverse(c, build_id: str) -> dict:
         (build_id, list(NFLVERSE_IN_SNAPSHOT)))}
 
 
+_BUILDS: "OrderedDict[str, dict]" = OrderedDict()
+BUILD_CACHE = 2  # D14: the current build and the one before the last flip
+_LOCK = threading.Lock()
+
+
+def build_data(c, build_id: str) -> dict:
+    """Players, crosswalk, every week's projection rows and the nflverse frames for one
+    build, read from Postgres once per process. Safe because a published build never
+    changes (D5)."""
+    with _LOCK:
+        if build_id in _BUILDS:
+            _BUILDS.move_to_end(build_id)
+            return _BUILDS[build_id]
+    weeks = c.execute("select weeks from builds where build_id = %s", (build_id,)).fetchone()
+    if weeks is None:
+        raise NoBuild(f"build {build_id} no longer exists")
+    players, xwalk = _build_players(c, build_id)
+    data = {"players": players, "xwalk": xwalk,
+            "projections": _build_projections(c, build_id, weeks[0]),
+            "nflverse": _build_nflverse(c, build_id)}
+    with _LOCK:
+        _BUILDS[build_id] = data
+        while len(_BUILDS) > BUILD_CACHE:
+            _BUILDS.popitem(last=False)
+    return data
+
+
+def clear_caches() -> None:
+    with _LOCK:
+        _BUILDS.clear()
+
+
 def from_build(c, build_id: str, client: SleeperClient, league_id: str) -> Snapshot:
     """§2 derived snapshot: the pinned daily build plus league state fetched now."""
     b = c.execute("select as_of, season, weeks, schedule_sha from builds where build_id = %s",
@@ -213,7 +247,8 @@ def from_build(c, build_id: str, client: SleeperClient, league_id: str) -> Snaps
     weeks = [w for w in range(current, snap0.last_week() + 1) if w in b_weeks]
     if season != b_season:
         raise NoBuild(f"today's build is for {b_season}, this league is {season}")
-    players, xwalk = _build_players(c, build_id)
+    data = build_data(c, build_id)
+    players, xwalk = data["players"], data["xwalk"]
     warnings = []
     rostered = {p for r in rosters.data for p in (r.get("players") or [])}
     missing = sorted(rostered - set(players))
@@ -230,7 +265,7 @@ def from_build(c, build_id: str, client: SleeperClient, league_id: str) -> Snaps
         rosters=rosters.data,
         users=users.data,
         players=players,
-        projections=_build_projections(c, build_id, weeks),
+        projections={w: data["projections"].get(w, []) for w in weeks},
         build_as_of=_iso(as_of),
         league_as_of=_iso(min(league.fetched_at, rosters.fetched_at)),
         payload_shas=shas,
@@ -239,7 +274,7 @@ def from_build(c, build_id: str, client: SleeperClient, league_id: str) -> Snaps
         matchups=matchups.data if matchups else [],
         build_id=build_id,
         warnings=tuple(warnings),
-        nflverse=_build_nflverse(c, build_id),
+        nflverse=data["nflverse"],
         xwalk=xwalk,
         transactions=txns,
     )

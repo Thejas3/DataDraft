@@ -53,11 +53,13 @@ class FakeClient:
     def __init__(self, replies):
         self.replies, self.sent = list(replies), []
         self.messages = self
+        self.beta = self
 
     def create(self, **kw):
         self.sent.append(kw)
         text = json.dumps(self.replies.pop(0))
-        return SimpleNamespace(stop_reason="end_turn",
+        return SimpleNamespace(stop_reason="end_turn", model="claude-opus-5-5",
+                               usage=SimpleNamespace(input_tokens=2000, output_tokens=500),
                                content=[SimpleNamespace(type="text", text=text)])
 
 
@@ -95,3 +97,27 @@ def test_bundle_omits_non_positive_best_week_and_counts_weeks():
     assert "your worst week for this trade" not in labels
     assert labels["weeks where your lineup shows a gain"] == "2 of 2"
     assert labels["weeks where your lineup shows a loss"] == "0 of 2"
+
+
+def test_cost_is_tracked_per_call_at_the_serving_models_rates():
+    snap, m, r = ruled()
+    res = court.argue(snap, m, r, client=FakeClient([BAD, GOOD]))
+    # 2 calls x (2000 x $4 + 500 x $20) / 1M = 2 x $0.018
+    assert res.calls == 2 and round(res.cost_usd, 4) == 0.036
+
+
+def test_spend_cap_never_starts_a_call_that_could_overshoot():
+    snap, m, r = ruled()
+    client = FakeClient([GOOD])
+    res = court.argue(snap, m, r, client=client, budget_usd=0.01)
+    assert client.sent == [] and res.notice == court.CAP_NOTICE and not res.arguments
+    roomy = court.argue(snap, m, r, client=FakeClient([GOOD]), budget_usd=1.0)
+    assert roomy.calls == 1 and roomy.arguments["for"]
+
+
+def test_requests_use_server_side_refusal_fallback():
+    snap, m, r = ruled()
+    client = FakeClient([GOOD])
+    court.argue(snap, m, r, client=client)
+    assert client.sent[0]["fallbacks"] == "default"
+    assert client.sent[0]["betas"] == ["server-side-fallback-2026-07-01"]

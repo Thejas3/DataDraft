@@ -53,6 +53,26 @@ current if a day fails. The last 14 builds are kept. Projections older than 30 h
 stale notice. `.github/workflows/daily.yml` runs the pipeline on a schedule; it needs
 the `DATABASE_URL` and `DATADRAFT_LEAGUES` repo secrets.
 
+## HTTP API
+
+```
+export DATADRAFT_PASSPHRASE=<shared with your league>  DATADRAFT_SECRET=<random string>
+datadraft serve --port 8000
+```
+
+Only leagues in `DATADRAFT_LEAGUES` are served, behind the shared passphrase
+(`POST /api/session`). A trade ruling returns its numbers right away
+(`POST /api/leagues/{id}/rulings`), and the cited arguments come from a second call
+(`POST /api/rulings/{slug}/court`). Each ruling gets an unlisted link; its public,
+read-only view is `GET /api/public/rulings/{slug}`. Also: `/api/leagues/{id}`,
+`.../waivers?roster_id=`, `.../startsit?roster_id=`, `.../players/{player_id}`,
+`/api/status`.
+
+Limits: `DATADRAFT_RULINGS_PER_HOUR` per league (default 30) and a daily Claude spend
+cap, `DATADRAFT_SPEND_CAP` dollars (default 2). Past the cap, rulings keep their numbers
+and say the arguments are unavailable today. Court calls use Claude's server-side
+refusal fallback. Set `DATADRAFT_COOKIE_SECURE=1` behind HTTPS.
+
 Not supported yet: keeper/dynasty leagues, draft picks or FAAB in trades, IDP slots.
 
 Run the tests with `.venv/bin/pytest`. The Postgres tests need the compose database

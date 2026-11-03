@@ -71,10 +71,13 @@ class SleeperClient:
     is retried once; league-state requests fall back to the last stored copy if it is
     under 24 h old, and that copy is marked stale so the ruling can say so."""
 
-    def __init__(self, store: PayloadStore, timeout: float = 10.0, now=time.time):
+    def __init__(self, store: PayloadStore, timeout: float = 10.0, now=time.time,
+                 league_max_age: float | None = None):
         self.store = store
         self.timeout = timeout
         self.now = now
+        # The API caches league state for 10 min (§ Pipelines); the CLI always refetches.
+        self.league_max_age = league_max_age
 
     def _http(self, url: str) -> bytes:
         req = urllib.request.Request(url, headers={"User-Agent": "datadraft/0.1"})
@@ -117,19 +120,23 @@ class SleeperClient:
         return self._get(f"/v1/user/{user_id}/leagues/nfl/{season}", max_age=3600)
 
     def league(self, league_id: str) -> Fetched:
-        return self._get(f"/v1/league/{league_id}")
+        return self._get(f"/v1/league/{league_id}", max_age=self.league_max_age)
 
     def rosters(self, league_id: str) -> Fetched:
-        return self._get(f"/v1/league/{league_id}/rosters")
+        return self._get(f"/v1/league/{league_id}/rosters", max_age=self.league_max_age)
 
     def users(self, league_id: str) -> Fetched:
-        return self._get(f"/v1/league/{league_id}/users")
+        return self._get(f"/v1/league/{league_id}/users", max_age=self.league_max_age)
 
     def transactions(self, league_id: str, week: int) -> Fetched:
-        return self._get(f"/v1/league/{league_id}/transactions/{week}")
+        return self._get(f"/v1/league/{league_id}/transactions/{week}",
+                         max_age=self.league_max_age)
 
-    def matchups(self, league_id: str, week: int) -> Fetched:
-        return self._get(f"/v1/league/{league_id}/matchups/{week}")
+    def matchups(self, league_id: str, week: int, max_age: float | None = -1) -> Fetched:
+        """max_age -1 = the league-state default; start/sit passes a short one for live
+        scores."""
+        return self._get(f"/v1/league/{league_id}/matchups/{week}",
+                         max_age=self.league_max_age if max_age == -1 else max_age)
 
     def schedule(self, season: str) -> Fetched:
         # Undocumented but public: one row per game with date, teams and status.

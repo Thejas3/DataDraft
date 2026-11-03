@@ -133,6 +133,20 @@ def parse_trade(snap, text: str) -> Trade:
     return Trade(mine.pop(), theirs.pop(), give, get)
 
 
+def trade_from_ids(snap, give: list, get: list) -> Trade:
+    """The web picker sends player ids, so nothing needs name resolution."""
+    give, get = tuple(str(p) for p in give), tuple(str(p) for p in get)
+    if not give or not get:
+        raise Invalid("both sides of the trade need at least one player")
+    mine = {owner_of(snap, p) for p in give}
+    theirs = {owner_of(snap, p) for p in get}
+    if len(mine) != 1 or len(theirs) != 1:
+        raise Invalid("each side of the trade has to come from one roster")
+    if mine == theirs:
+        raise Invalid("both sides of the trade are on the same roster")
+    return Trade(mine.pop(), theirs.pop(), give, get)
+
+
 # ---- horizon (D17) -----------------------------------------------------------------
 
 def _team(snap, pid: str) -> str | None:

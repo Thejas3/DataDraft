@@ -19,6 +19,9 @@ def home(tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)  # file mode unless a test opts in
+    from datadraft.engine import clear_caches
+
+    clear_caches()  # tests reuse build ids across schemas; production ids are unique
     return tmp_path
 
 
