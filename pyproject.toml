@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datadraft"
+version = "0.1.0"
+description = "NFL fantasy trade rulings for Sleeper leagues"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["anthropic>=2.3,<3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=9", "hypothesis>=6.170"]
+
+[project.scripts]
+datadraft = "datadraft.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
