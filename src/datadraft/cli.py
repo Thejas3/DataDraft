@@ -3,19 +3,32 @@
   datadraft leagues <sleeper_username> [--season 2026]
   datadraft trade <league_id> "A, B for C" [--no-court] [--band 1.0]
 
+With DATABASE_URL set (Milestone 2), rulings sit on the daily build in Postgres:
+  datadraft db init                      create the tables
+  datadraft pipeline [--league ID ...]   run the daily build (default: DATADRAFT_LEAGUES)
+  datadraft status                       show the current build
+
 "A, B for C" means you send A and B and receive C. Your team is whichever roster holds
 A and B, so the same command works for anyone in the league."""
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import os
 import sys
+
+from . import db
 
 from .decide import BAND
 from .delta import TradeDelta, player_name
 from .engine import evaluate
 from .ingest import FetchError, PayloadStore, SleeperClient, data_dir
-from .snapshot import build_snapshot
+from .snapshot import NoBuild, build_snapshot
+
+
+def make_client() -> SleeperClient:
+    return SleeperClient(db.PgPayloadStore() if db.enabled() else PayloadStore(data_dir()))
 
 
 def team_name(snap, roster_id: int) -> str:
@@ -96,7 +109,7 @@ def render(result) -> str:
 
 
 def cmd_leagues(args) -> int:
-    client = SleeperClient(PayloadStore(data_dir()))
+    client = make_client()
     user = client.user(args.username).data
     if not user:
         print(f"No Sleeper user named {args.username!r}.", file=sys.stderr)
@@ -111,11 +124,14 @@ def cmd_leagues(args) -> int:
 
 
 def cmd_trade(args) -> int:
-    client = SleeperClient(PayloadStore(data_dir()))
+    client = make_client()
     try:
         snap = build_snapshot(client, args.league_id)
     except FetchError as e:
         print(f"Can't reach Sleeper right now: {e}. Try again shortly.", file=sys.stderr)
+        return 2
+    except NoBuild as e:
+        print(f"No projections to rule on: {e}.", file=sys.stderr)
         return 2
     if not snap.league:
         print(f"No Sleeper league with id {args.league_id}.", file=sys.stderr)
@@ -124,6 +140,66 @@ def cmd_trade(args) -> int:
                       band=args.band, use_court=not args.no_court)
     print(render(result))
     return 3 if result.error else 0
+
+
+def _need_db() -> bool:
+    if not db.enabled():
+        print("Set DATABASE_URL first (docker compose up -d, then see README).", file=sys.stderr)
+        return False
+    return True
+
+
+def cmd_db(args) -> int:
+    if not _need_db():
+        return 1
+    db.init()
+    print("Tables are ready.")
+    return 0
+
+
+def cmd_pipeline(args) -> int:
+    from .pipeline import BuildError, run_daily
+
+    if not _need_db():
+        return 1
+    leagues = args.league or [x for x in os.environ.get("DATADRAFT_LEAGUES", "").split(",") if x]
+    db.init()
+    try:
+        rep = run_daily(db.conn(), make_client(), leagues)
+    except (BuildError, FetchError) as e:
+        print(f"Build not published, the previous one stays current: {e}", file=sys.stderr)
+        return 2
+    print(f"Published build {rep.build_id} (weeks {rep.weeks[0]}-{rep.weeks[-1]})")
+    print(f"  players {rep.counts['players']}, projection rows {rep.counts['projection_rows']}, "
+          f"stats {rep.counts['projection_stats']}")
+    print("  nflverse " + ", ".join(f"{k} {v}" for k, v in rep.counts["nflverse"].items()))
+    print(f"  rostered players with no nflverse match: {len(rep.unmatched)}")
+    for lid, g in rep.guard.items():
+        print(f"  guard {lid}: {g}")
+    print("  pruned " + ", ".join(f"{k} {v}" for k, v in rep.pruned.items()))
+    return 0
+
+
+def cmd_status(args) -> int:
+    if not _need_db():
+        return 1
+    row = db.conn().execute(
+        "select b.build_id, b.as_of, b.weeks, b.guard, b.counts, c.flipped_at, "
+        "(select count(*) from builds), (select count(*) from ledger) "
+        "from current_build c join builds b using (build_id)").fetchone()
+    if row is None:
+        print("No build published yet. Run `datadraft pipeline --league <league_id>`.")
+        return 1
+    bid, as_of, weeks, guard, counts, flipped, n_builds, n_ledger = row
+    age_h = (dt.datetime.now(dt.UTC).timestamp() - as_of) / 3600
+    print(f"Current build {bid}, data as of "
+          f"{dt.datetime.fromtimestamp(as_of, dt.UTC):%Y-%m-%d %H:%MZ} ({age_h:.1f} h ago"
+          f"{', STALE' if age_h > 30 else ''}), weeks {weeks[0]}-{weeks[-1]}")
+    print(f"  players {counts.get('players')}, unmatched rostered "
+          f"{counts.get('unmatched_rostered')}; {n_builds} builds kept; {n_ledger} rulings frozen")
+    for lid, g in guard.items():
+        print(f"  guard {lid}: {g}")
+    return 0
 
 
 def main(argv=None) -> int:
@@ -140,6 +216,14 @@ def main(argv=None) -> int:
     tr.add_argument("--no-court", action="store_true", help="skip the Claude arguments")
     tr.add_argument("--band", type=float, default=BAND, help="verdict band, pts/week")
     tr.set_defaults(func=cmd_trade)
+    dbp = sub.add_parser("db", help="Postgres setup")
+    dbp.add_argument("action", choices=["init"])
+    dbp.set_defaults(func=cmd_db)
+    pl = sub.add_parser("pipeline", help="run the daily build into Postgres")
+    pl.add_argument("--league", action="append", help="league id (repeatable)")
+    pl.set_defaults(func=cmd_pipeline)
+    st = sub.add_parser("status", help="show the current daily build")
+    st.set_defaults(func=cmd_status)
     args = p.parse_args(argv)
     return args.func(args)
 

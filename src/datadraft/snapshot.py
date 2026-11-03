@@ -9,7 +9,14 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 
+from . import db
 from .ingest import PayloadStore, SleeperClient, data_dir
+
+STALE_BUILD_S = 30 * 3600  # §2: older daily builds get a "data is stale" notice
+
+
+class NoBuild(Exception):
+    """Postgres mode, but no daily build has been published yet."""
 
 
 @dataclass(frozen=True)
@@ -28,6 +35,8 @@ class Snapshot:
     league_stale: bool = False
     schedule: list = field(default_factory=list)
     matchups: list = field(default_factory=list)  # most recent completed week (D19 guard)
+    build_id: str = ""  # Postgres mode: the daily build this snapshot sits on (§2)
+    warnings: tuple = ()  # shown with the ruling (stale build, players missing from build)
 
     @property
     def snapshot_id(self) -> str:
@@ -60,8 +69,16 @@ def _iso(ts: float) -> str:
 
 
 def build_snapshot(client: SleeperClient, league_id: str) -> Snapshot:
+    if db.enabled():
+        c = db.conn()
+        snap = from_build(c, current_build_id(c), client, league_id)
+        if snap.league:
+            save_manifest(snap)
+        return snap
     state = client.state()
     league = client.league(league_id)
+    if not league.data:
+        return Snapshot("", 0, dt.date.today(), {}, [], [], {}, {}, "", "")
     rosters = client.rosters(league_id)
     users = client.users(league_id)
     players = client.players()
@@ -104,7 +121,96 @@ def build_snapshot(client: SleeperClient, league_id: str) -> Snapshot:
     return snap
 
 
+def current_build_id(c) -> str:
+    row = c.execute("select build_id from current_build").fetchone()
+    if row is None:
+        raise NoBuild("no daily build yet: run `datadraft pipeline --league <league_id>`")
+    return row[0]
+
+
+def _build_players(c, build_id: str) -> dict:
+    return {pid: info for pid, info in c.execute(
+        "select player_id, info from build_players where build_id = %s", (build_id,))}
+
+
+def _build_projections(c, build_id: str, weeks) -> dict:
+    out: dict = {w: {} for w in weeks}
+    for week, pid, stat, value in c.execute(
+            "select week, player_id, stat, value from build_projections where build_id = %s "
+            "and week = any(%s) order by week, player_id, stat", (build_id, list(weeks))):
+        out[week].setdefault(pid, {"player_id": pid, "week": week, "stats": {}})["stats"][stat] = value
+    return {w: list(rows.values()) for w, rows in out.items()}
+
+
+def from_build(c, build_id: str, client: SleeperClient, league_id: str) -> Snapshot:
+    """§2 derived snapshot: the pinned daily build plus league state fetched now."""
+    b = c.execute("select as_of, season, weeks, schedule_sha from builds where build_id = %s",
+                  (build_id,)).fetchone()
+    if b is None:
+        raise NoBuild(f"build {build_id} no longer exists")
+    as_of, b_season, b_weeks, schedule_sha = b
+    state = client.state()
+    league = client.league(league_id)
+    if not league.data:
+        return Snapshot("", 0, dt.date.today(), {}, [], [], {}, {}, "", "")
+    rosters = client.rosters(league_id)
+    users = client.users(league_id)
+    season = str(league.data.get("season") or state.data.get("season"))
+    current = int(state.data.get("display_week") or state.data.get("week") or 1)
+    shas = {"build": build_id, "state": state.sha, "league": league.sha,
+            "rosters": rosters.sha, "users": users.sha}
+    matchups = None
+    if current > 1:
+        matchups = client.matchups(league_id, current - 1)
+        shas["matchups"] = matchups.sha
+    snap0 = Snapshot(season, current, dt.date.today(), league.data, rosters.data,
+                     users.data, {}, {}, "", "")
+    weeks = [w for w in range(current, snap0.last_week() + 1) if w in b_weeks]
+    if season != b_season:
+        raise NoBuild(f"today's build is for {b_season}, this league is {season}")
+    players = _build_players(c, build_id)
+    warnings = []
+    rostered = {p for r in rosters.data for p in (r.get("players") or [])}
+    missing = sorted(rostered - set(players))
+    if missing:
+        warnings.append(f"{len(missing)} rostered players aren't in today's build; add this "
+                        "league to DATADRAFT_LEAGUES so the pipeline keeps them.")
+    if client.now() - as_of > STALE_BUILD_S:
+        warnings.append(f"Data is stale: projections are from {_iso(as_of)}, over 30 h ago.")
+    return Snapshot(
+        season=season,
+        current_week=current,
+        today=dt.datetime.fromtimestamp(rosters.fetched_at).date(),
+        league=league.data,
+        rosters=rosters.data,
+        users=users.data,
+        players=players,
+        projections=_build_projections(c, build_id, weeks),
+        build_as_of=_iso(as_of),
+        league_as_of=_iso(min(league.fetched_at, rosters.fetched_at)),
+        payload_shas=shas,
+        league_stale=league.stale or rosters.stale,
+        schedule=db.PgPayloadStore(c).get(schedule_sha),
+        matchups=matchups.data if matchups else [],
+        build_id=build_id,
+        warnings=tuple(warnings),
+    )
+
+
+def _manifest(snap: Snapshot) -> dict:
+    return {"season": snap.season, "current_week": snap.current_week,
+            "today": snap.today.isoformat(), "build_as_of": snap.build_as_of,
+            "league_as_of": snap.league_as_of, "league_stale": snap.league_stale,
+            "payload_shas": snap.payload_shas, "build_id": snap.build_id,
+            "weeks": sorted(snap.projections), "warnings": list(snap.warnings)}
+
+
 def save_manifest(snap: Snapshot) -> None:
+    if db.enabled():
+        db.conn().execute("insert into snapshots (snapshot_id, build_id, manifest) values "
+                          "(%s, %s, %s) on conflict do nothing",
+                          (snap.snapshot_id, snap.build_id, json.dumps(_manifest(snap))))
+        return
     root = data_dir() / "snapshots"
     root.mkdir(parents=True, exist_ok=True)
     manifest = {"season": snap.season, "current_week": snap.current_week,
@@ -116,6 +222,8 @@ def save_manifest(snap: Snapshot) -> None:
 
 def load_snapshot(snapshot_id: str) -> Snapshot:
     """Rebuild a saved snapshot from its stored payloads (no network)."""
+    if db.enabled():
+        return _load_from_db(db.conn(), snapshot_id)
     m = json.loads((data_dir() / "snapshots" / f"{snapshot_id}.json").read_text())
     store = PayloadStore(data_dir())
     shas = m["payload_shas"]
@@ -127,3 +235,23 @@ def load_snapshot(snapshot_id: str) -> Snapshot:
                     m["build_as_of"], m["league_as_of"], shas, m["league_stale"],
                     store.get(shas["schedule"]),
                     store.get(shas["matchups"]) if "matchups" in shas else [])
+
+
+def _load_from_db(c, snapshot_id: str) -> Snapshot:
+    row = c.execute("select manifest from snapshots where snapshot_id = %s",
+                    (snapshot_id,)).fetchone()
+    if row is None:
+        raise KeyError(f"no snapshot {snapshot_id}")
+    m = row[0]
+    shas, build_id = m["payload_shas"], m["build_id"]
+    store = db.PgPayloadStore(c)
+    sched = c.execute("select schedule_sha from builds where build_id = %s", (build_id,)).fetchone()
+    if sched is None:
+        raise NoBuild(f"snapshot {snapshot_id} used build {build_id}, which has been pruned")
+    return Snapshot(m["season"], m["current_week"], dt.date.fromisoformat(m["today"]),
+                    store.get(shas["league"]), store.get(shas["rosters"]),
+                    store.get(shas["users"]), _build_players(c, build_id),
+                    _build_projections(c, build_id, m["weeks"]), m["build_as_of"],
+                    m["league_as_of"], shas, m["league_stale"], store.get(sched[0]),
+                    store.get(shas["matchups"]) if "matchups" in shas else [],
+                    build_id, tuple(m.get("warnings") or ()))

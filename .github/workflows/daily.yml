@@ -1,0 +1,19 @@
+# Daily build, ~1 h after nflverse's 07:00 UTC refresh. GitHub cron can run late; that's
+# fine at this cadence, and anything over 30 h old shows a stale notice.
+# Needs repo secrets DATABASE_URL (Neon) and DATADRAFT_LEAGUES (comma-separated ids).
+name: daily-build
+on:
+  schedule: [{cron: "0 8 * * *"}]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - run: pip install -e .
+      - run: datadraft pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATADRAFT_LEAGUES: ${{ secrets.DATADRAFT_LEAGUES }}

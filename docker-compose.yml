@@ -1,0 +1,17 @@
+# Local Postgres for DataDraft. Then:
+#   export DATABASE_URL=postgresql://datadraft:datadraft@localhost:5433/datadraft
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: datadraft
+      POSTGRES_PASSWORD: datadraft
+      POSTGRES_DB: datadraft
+    ports: ["5433:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "datadraft"]
+      interval: 2s
+      retries: 15
+volumes:
+  pgdata:

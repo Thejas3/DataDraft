@@ -83,6 +83,10 @@ class SleeperClient:
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     return resp.read()
+            except urllib.error.HTTPError as e:
+                if e.code == 404:  # malformed id: same as Sleeper's `null` for unknown ones
+                    return b"null"
+                last_err = e
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last_err = e
         raise FetchError(f"Sleeper didn't respond for {url}: {last_err}")
@@ -137,3 +141,53 @@ class SleeperClient:
         return self._get(
             f"/projections/nfl/{season}/{week}?season_type=regular&{pos}", max_age=12 * 3600
         )
+
+
+# --- nflverse + ID crosswalk (Milestone 2, D4) --------------------------------------
+
+# nflverse names the Rams "LA"; every other Sleeper team abbreviation matches.
+SLEEPER_TO_NFLVERSE_TEAM = {"LAR": "LA"}
+
+
+def load_nflverse(season: int) -> dict:
+    """The nflverse tables a build pins, as polars frames. Raises on any failure, so a
+    half-fetched day never gets published (D5)."""
+    import nflreadpy as nfl
+
+    return {
+        "schedules": nfl.load_schedules(season),
+        "injuries": nfl.load_injuries(season),
+        "ff_opportunity": nfl.load_ff_opportunity(season),
+        "player_stats": nfl.load_player_stats(season),
+        "team_stats": nfl.load_team_stats(season),
+        "ff_playerids": nfl.load_ff_playerids(),
+    }
+
+
+def nflverse_team(team: str | None) -> str | None:
+    return SLEEPER_TO_NFLVERSE_TEAM.get(team, team) if team else None
+
+
+def crosswalk(players: dict, ids, teams: set) -> dict[str, tuple[str | None, str | None]]:
+    """D4: {sleeper_id: (nflverse_key, match)}. Skill players and kickers match by
+    sleeper_id -> gsis_id through ff_playerids; DEF (and kickers with no gsis id) match by
+    team abbreviation. Unmatched players map to (None, None): they keep Sleeper-only data
+    and their nflverse-derived fields are marked 'no nflverse match'."""
+    import polars as pl
+
+    gsis = dict(
+        ids.filter(pl.col("sleeper_id").is_not_null() & pl.col("gsis_id").is_not_null())
+        .select(pl.col("sleeper_id").cast(pl.Utf8), "gsis_id").iter_rows())
+    out = {}
+    for pid, info in players.items():
+        pos = set(info.get("fantasy_positions") or [info.get("position")])
+        team = nflverse_team(pid if "DEF" in pos else info.get("team"))
+        if "DEF" in pos:
+            out[pid] = (team, "team") if team in teams else (None, None)
+        elif pid in gsis:
+            out[pid] = (gsis[pid], "gsis")
+        elif "K" in pos and team in teams:
+            out[pid] = (team, "team")
+        else:
+            out[pid] = (None, None)
+    return out

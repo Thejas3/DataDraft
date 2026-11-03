@@ -81,6 +81,7 @@ def evaluate(action: dict, snapshot_id: str, *, snapshot: Snapshot | None = None
     if snap.league_stale:
         ruling.notes.append(f"Rosters as of {snap.league_as_of}: Sleeper didn't respond, "
                             "so this uses the last stored copy.")
+    ruling.notes.extend(snap.warnings)
     result = Result(ruling, snap, matrix)
     if use_court:
         result.court = court.argue(snap, matrix, ruling, client=court_client)

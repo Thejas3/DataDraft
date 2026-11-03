@@ -7,7 +7,7 @@ import hashlib
 import json
 import time
 
-from . import ENGINE_VERSION
+from . import ENGINE_VERSION, db
 from .delta import Side, TradeDelta
 from .ingest import data_dir
 
@@ -30,17 +30,26 @@ def ruling_key(action: dict, snapshot_id: str) -> str:
 def freeze(action: dict, snapshot_id: str, league_id: str, ruling) -> str:
     """Append the ruling unless this exact (action, snapshot, engine) is already there."""
     key = ruling_key(action, snapshot_id)
+    row = _row(key, action, snapshot_id, league_id, ruling)
+    if db.enabled():
+        db.conn().execute("insert into ledger (key, frozen_at, snapshot_id, row) values "
+                          "(%s, %s, %s, %s) on conflict do nothing",
+                          (key, row["frozen_at"], snapshot_id, json.dumps(row)))
+        return key
     path = data_dir() / "ledger.jsonl"
     if path.exists() and any(json.loads(l)["key"] == key for l in path.read_text().splitlines()):
         return key
-    row = {
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    return key
+
+
+def _row(key, action, snapshot_id, league_id, ruling) -> dict:
+    return {
         "key": key, "frozen_at": time.time(), "engine_version": ENGINE_VERSION,
         "league_id": league_id, "snapshot_id": snapshot_id, "action": action,
         "verdict": ruling.verdict, "reason": ruling.reason, "band": ruling.band,
         "trade": _trade(ruling.delta) if ruling.delta else None,
         "counter": _trade(ruling.counter) if ruling.counter else None,
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
-        f.write(json.dumps(row) + "\n")
-    return key

@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "NFL fantasy trade rulings for Sleeper leagues"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["anthropic>=2.3,<3"]
+dependencies = ["anthropic>=2.3,<3", "nflreadpy>=0.1.5", "psycopg[binary]>=3.2"]
 
 [project.optional-dependencies]
 dev = ["pytest>=9", "hypothesis>=6.170"]

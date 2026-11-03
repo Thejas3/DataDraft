@@ -18,6 +18,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("DATADRAFT_HOME", str(tmp_path))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)  # file mode unless a test opts in
     return tmp_path
 
 
