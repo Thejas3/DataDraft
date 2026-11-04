@@ -73,6 +73,13 @@ cap, `DATADRAFT_SPEND_CAP` dollars (default 2). Past the cap, rulings keep their
 and say the arguments are unavailable today. Court calls use Claude's server-side
 refusal fallback. Set `DATADRAFT_COOKIE_SECURE=1` behind HTTPS.
 
+## Web app
+
+`web/` is the Next.js front end: Trade Court, Waivers, Start/Sit, Players, and a public
+card page per ruling (`/c/:slug`, with a PNG card and link preview). Run the API, then
+`cd web && npm install && DATADRAFT_API_URL=http://127.0.0.1:8000 npm run dev`.
+See `web/README.md`.
+
 Not supported yet: keeper/dynasty leagues, draft picks or FAAB in trades, IDP slots.
 
 Run the tests with `.venv/bin/pytest`. The Postgres tests need the compose database
